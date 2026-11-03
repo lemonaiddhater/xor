@@ -1,794 +1,508 @@
-pkg install -y python
-cat > ~/xor.py << 'PYEOF'
 #!/usr/bin/env python3
-# ============================================================
-#  XOR v3 :: python core  (stdlib only, termux-friendly)
-#    python xor.py          -> boot + shell
-#    python xor.py !scan    -> jump to menu
-# ============================================================
-import os, sys, json, time, random, socket, subprocess, shutil, re
+# XOR — purple terminal toolkit for Termux
+# Python standard library only. Use scans only on networks/systems you own or have permission to test.
+
+import os, sys, json, time, random, socket, platform, subprocess, re, ipaddress, ssl
 import urllib.request, urllib.error
-from datetime import datetime, timezone
+from datetime import datetime
+from urllib.parse import urlparse
 
-HOME = os.path.expanduser("~")
-CACHE = os.path.join(HOME, ".cache", "xor")
-os.makedirs(CACHE, exist_ok=True)
-for f in ("links", "notes", "history", "vendors", "theme"):
-    p = os.path.join(CACHE, f)
-    if not os.path.exists(p):
-        open(p, "w").close()
+APP = "XOR"
+VERSION = "1.0"
+BASE = os.path.join(os.path.expanduser("~"), ".xor")
+DATA_FILE = os.path.join(BASE, "xor_data.json")
 
-RST = "\x1b[0m"; DIM = "\x1b[2m"; HI = "\x1b[1;97m"
-WARN = "\x1b[1;33m"; ERR = "\x1b[1;31m"; OK = "\x1b[1;32m"
+# ANSI palette: purple / violet / black / grey
+P = "\033[38;5;141m"
+V = "\033[38;5;99m"
+L = "\033[38;5;183m"
+W = "\033[97m"
+G = "\033[38;5;245m"
+R = "\033[38;5;203m"
+DIM = "\033[2m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
+CLEAR = "\033[2J\033[H"
 
-def load_theme():
-    global A1, A2, A3
-    t = open(os.path.join(CACHE, "theme")).read().strip()
-    themes = {
-        "cyan":   ("\x1b[1;36m", "\x1b[36m",  "\x1b[2;36m"),
-        "green":  ("\x1b[1;32m", "\x1b[32m",  "\x1b[2;32m"),
-        "purple": ("\x1b[1;35m", "\x1b[35m",  "\x1b[2;35m"),
-        "red":    ("\x1b[1;31m", "\x1b[31m",  "\x1b[2;31m"),
-        "amber":  ("\x1b[1;33m", "\x1b[33m",  "\x1b[2;33m"),
-        "ice":    ("\x1b[1;94m", "\x1b[94m",  "\x1b[2;34m"),
-    }
-    A1, A2, A3 = themes.get(t, themes["cyan"])
-load_theme()
-
-UA = "Mozilla/5.0 (Linux; Android 13)"
-
-def term_size():
-    try:
-        s = shutil.get_terminal_size()
-        return s.columns, s.lines
-    except Exception:
-        return 80, 24
-
-COLS, ROWS = term_size()
-
-def cprint(text, color=None):
-    color = color or A1
-    pad = max(0, (COLS - len(text)) // 2)
-    print(" " * pad + color + text + RST)
-
-def hr(w=48):
-    print("  " + A3 + "=" * w + RST)
-
-def title(text):
-    os.system("clear")
-    global COLS, ROWS
-    COLS, ROWS = term_size()
-    print()
-    cprint(text)
-    hr()
-    print()
-
-def typew(text, color=None, delay=0.012):
-    color = color or A2
-    sys.stdout.write("  " + color)
-    for ch in text:
-        sys.stdout.write(ch)
-        sys.stdout.flush()
-        time.sleep(delay)
-    sys.stdout.write(RST + "\n")
-
-def bar(steps=20):
-    w = min(26, COLS - 8)
-    for i in range(steps + 1):
-        f = i * w // steps
-        line = "\r  " + A3 + "[" + A1 + "#" * f + A3 + "." * (w - f) + RST + "] %3d%%" % (i * 100 // steps)
-        sys.stdout.write(line); sys.stdout.flush()
-        time.sleep(0.012)
-    print()
+def color(text, c=P):
+    return f"{c}{text}{RESET}"
 
 def pause():
-    input("  " + A3 + "[enter]" + RST)
+    input(color("\n[ press ENTER ]", G))
 
-def ask(prompt):
+def line(ch="─", width=58):
+    print(color(ch * width, V))
+
+def typewrite(text, delay=0.006, c=P):
+    for ch in str(text):
+        print(c + ch + RESET, end="", flush=True)
+        time.sleep(delay)
+    print()
+
+def safe_input(prompt):
     try:
-        return input("  " + A2 + prompt + RST + " ").strip()
-    except EOFError:
+        return input(color(prompt, L)).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
         return ""
 
-def move(r, c):
-    return "\x1b[%d;%dH" % (r, c)
-
-def http_json(url, timeout=8):
+def load_data():
+    os.makedirs(BASE, exist_ok=True)
+    default = {"notes": [], "links": [], "history": [], "theme": "purple"}
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": UA})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode("utf-8", "replace"))
-    except Exception:
-        return None
-
-def http_status(url, timeout=6):
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": UA}, method="HEAD")
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status
-    except urllib.error.HTTPError as e:
-        return e.code
-    except Exception:
-        return 0
-
-def get(url, timeout=8):
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": UA})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.read().decode("utf-8", "replace")
-    except Exception:
-        return ""
-
-def clipboard_set(text):
-    if shutil.which("termux-clipboard-set"):
-        subprocess.run(["termux-clipboard-set", text])
-        print("  " + OK + "copied" + RST)
-    else:
-        print("  " + WARN + "no clipboard tool (pkg install termux-api)" + RST)
-
-def open_url(url):
-    if shutil.which("termux-open-url"):
-        subprocess.run(["termux-open-url", url])
-    else:
-        print("  " + WARN + "open manually: " + url + RST)
-
-# ---------- animation ----------
-LOGO = [
-    "#     #  #######  ###### ",
-    " #   #  #        #     # ",
-    "  # #   #####    #     # ",
-    "  # #   #####    #     # ",
-    " #   #  #        #     # ",
-    "#     #  #######  ###### ",
-]
-GLYPHS = "#%&*+-=<>01XOR"
-
-def draw_logo(glitch=False):
-    pad = max(0, (COLS - 25) // 2)
-    for line in LOGO:
-        out = ""
-        for ch in line:
-            if ch == " ":
-                out += " "
-            elif glitch and random.random() < 0.8:
-                out += HI + random.choice(GLYPHS)
-            else:
-                out += A1 + ch
-        print(" " * pad + out + RST + "\x1b[K")
-
-def rain(frames=35):
-    chars = "01XOR#%&*+=/<>"
-    heads = {}
-    for c in range(1, COLS, 3):
-        heads[c] = random.randint(0, ROWS)
-    sys.stdout.write("\x1b[?25l")
-    for _ in range(frames):
-        buf = []
-        for c, y in heads.items():
-            if y > 6:
-                buf.append(move(y - 6, c) + " ")
-            if 1 <= y <= ROWS:
-                buf.append(move(y, c) + HI + random.choice(chars))
-            if 2 <= y <= ROWS:
-                buf.append(move(y - 1, c) + A3 + random.choice(chars))
-            heads[c] = random.randint(0, 4) if y > ROWS else y + 1
-        sys.stdout.write("".join(buf) + RST)
-        sys.stdout.flush()
-        time.sleep(0.04)
-    sys.stdout.write("\x1b[?25h")
-
-def boot():
-    os.system("clear")
-    global COLS, ROWS
-    COLS, ROWS = term_size()
-    rain()
-    os.system("clear")
-    for _ in range(12):
-        sys.stdout.write("\x1b[2J" + move(2, 1))
-        draw_logo(glitch=True)
-        sys.stdout.flush()
-        time.sleep(0.05)
-    sys.stdout.write("\x1b[2J" + move(2, 1))
-    draw_logo(glitch=False)
-    print()
-    cprint("XOR :: eXclusive-OR terminal core  v3.0", A2)
-    typew("booting xor core ...", A3); bar()
-    typew("loading modules: scan / osint / gen / notes", A3); bar()
-    time.sleep(0.2)
-    os.system("clear")
-    print()
-    status_panel()
-    print()
-    typew("access granted - type !help for the menu", OK)
-
-def banner_again():
-    os.system("clear")
-    for _ in range(8):
-        sys.stdout.write("\x1b[2J" + move(2, 1))
-        draw_logo(glitch=True)
-        sys.stdout.flush()
-        time.sleep(0.06)
-    sys.stdout.write("\x1b[2J" + move(2, 1))
-    draw_logo(glitch=False)
-    print()
-    cprint("XOR :: v3.0", A2)
-
-# ---------- status ----------
-def status_panel():
-    op = os.environ.get("USER") or os.environ.get("LOGNAME") or "user"
-    node = os.uname().nodename
-    acc = "root (full)" if os.geteuid() == 0 else "user"
-    dev = "unknown"
-    try:
-        out = subprocess.run(["getprop", "ro.product.model"], capture_output=True, text=True, timeout=2)
-        if out.stdout.strip():
-            dev = out.stdout.strip()
-    except Exception:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        if isinstance(saved, dict):
+            for k, v in default.items():
+                saved.setdefault(k, v)
+            return saved
+    except (OSError, ValueError):
         pass
-    t = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    osname = os.uname().sysname + " " + os.uname().release
-    try:
-        out = subprocess.run(["getprop", "ro.build.version.release"], capture_output=True, text=True, timeout=2)
-        if out.stdout.strip():
-            osname = "Android " + out.stdout.strip() + " / " + os.uname().machine
-    except Exception:
-        pass
-    data = http_json("http://ip-api.com/json/?fields=query,country,isp", 4) or {}
-    pub = data.get("query", "offline")
-    cc = data.get("country", "")
-    isp = data.get("isp", "-")
-    rows = [
-        ("OPERATOR", op + "@" + node),
-        ("ACCESS", acc),
-        ("DEVICE", dev),
-        ("NODE", node),
-        ("TIME", t),
-        ("OS", osname),
-        ("EXTERNAL", pub + (" [" + cc + "]" if cc else "")),
-        ("ISP", isp),
-    ]
-    w = 44
-    print("  " + A1 + "+" + "-" * (w + 2) + "+" + RST)
-    for k, v in rows:
-        print("  " + A1 + "|" + RST + " " + A3 + k.ljust(9) + RST + " " + A2 + str(v)[:w].ljust(w) + RST + " " + A1 + "|" + RST)
-    print("  " + A1 + "+" + "-" * (w + 2) + "+" + RST)
-    warns = []
-    if pub == "offline":
-        warns.append("no-internet")
-    if not shutil.which("termux-clipboard-set"):
-        warns.append("clipboard-optional-missing")
-    if warns:
-        print("  " + WARN + "[!] WARNINGS:" + RST + " " + ERR + " ".join(warns) + RST)
-    else:
-        print("  " + OK + "[ok] all systems nominal" + RST)
+    return default
 
-# ---------- net ----------
-def local_ip():
+DATA = load_data()
+
+def save_data():
+    os.makedirs(BASE, exist_ok=True)
+    tmp = DATA_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(DATA, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, DATA_FILE)
+
+def record_history(command):
+    DATA["history"].append({"command": command, "time": datetime.now().isoformat(timespec="seconds")})
+    DATA["history"] = DATA["history"][-100:]
+    save_data()
+
+def clear():
+    os.system("clear" if os.name != "nt" else "cls")
+
+def banner():
+    print(color(r"""
+██╗  ██╗ ██████╗ ██████╗
+╚██╗██╔╝██╔═══██╗██╔══██╗
+ ╚███╔╝ ██║   ██║██████╔╝
+ ██╔██╗ ██║   ██║██╔══██╗
+██╔╝ ██╗╚██████╔╝██║  ██║
+╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝""", P))
+    print(color("          X O R  /  OPERATOR TOOLKIT", L))
+    print(color("          TERMUX EDITION  •  v" + VERSION, G))
+    line()
+
+def get_local_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-    except Exception:
-        ip = "127.0.0.1"
+        s.connect(("1.1.1.1", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return "Unavailable"
     finally:
         s.close()
-    return ip
 
-def read_mac_for(ip):
+def get_android_model():
+    if "ANDROID_ROOT" not in os.environ and "TERMUX_VERSION" not in os.environ:
+        return platform.node() or "Unknown device"
     try:
-        with open("/proc/net/arp") as f:
-            for line in f:
-                parts = line.split()
-                if parts and parts[0] == ip and len(parts) >= 6:
-                    return parts[3]
+        model = subprocess.check_output(["getprop", " ro.product.model".strip()], text=True, timeout=2).strip()
+        return model or "Android device"
     except Exception:
-        pass
-    return "--"
+        return "Android device"
 
-def vendor_lookup(mac):
-    if mac in ("--", "00:00:00:00:00:00", "incomplete"):
-        return "unknown"
-    try:
-        with open(os.path.join(CACHE, "vendors")) as f:
-            for line in f:
-                if line.lower().startswith(mac.lower()):
-                    return line.strip().split("|", 1)[1]
-    except Exception:
-        pass
-    v = get("https://api.macvendors.com/" + mac, 4)[:26].strip() or "unknown"
-    time.sleep(0.25)
-    try:
-        with open(os.path.join(CACHE, "vendors"), "a") as f:
-            f.write(mac + "|" + v + "\n")
-    except Exception:
-        pass
-    return v
-
-def lan_scan():
-    base = local_ip()
-    if base.startswith("127."):
-        print("  " + ERR + "no network" + RST)
-        return
-    prefix = ".".join(base.split(".")[:3])
-    print("  " + A3 + "sweeping" + RST + " " + prefix + ".0/24\n")
-    hosts = []
-    if shutil.which("nmap"):
-        try:
-            out = subprocess.run(["nmap", "-sn", prefix + ".0/24"], capture_output=True, text=True, timeout=60)
-            for line in out.stdout.splitlines():
-                line = line.strip()
-                if line.startswith("Nmap scan report for"):
-                    hosts.append(line.split()[-1].strip("()"))
-        except Exception:
-            pass
-    else:
-        print("  " + A3 + "(nmap absent - using arp cache)" + RST)
-        try:
-            with open("/proc/net/arp") as f:
-                for line in f.readlines()[1:]:
-                    parts = line.split()
-                    if len(parts) >= 6 and parts[3] not in ("00:00:00:00:00:00", "incomplete"):
-                        hosts.append(parts[0])
-        except Exception:
-            pass
-    hosts = sorted(set(hosts))
-    print("  %-16s %-18s %-26s" % ("IP", "MAC", "VENDOR / DEVICE"))
-    print("  " + "-" * 60)
-    for ip in hosts:
-        mac = read_mac_for(ip)
-        vendor = vendor_lookup(mac)
-        tag = " *this-device" if ip == base else ""
-        print("  " + A1 + ip.ljust(16) + RST + " " + mac.ljust(18) + " " + A2 + vendor.ljust(26) + RST + OK + tag + RST)
-    print("\n  " + A3 + "hosts: " + str(len(hosts)) + RST)
-
-PORTS = [21, 22, 23, 25, 53, 80, 110, 139, 143, 443, 445, 3306, 3389, 5432, 8080, 8443]
-
-def port_scan():
-    tgt = ask("target ip/domain:")
-    if not tgt:
-        return
-    print("  " + A3 + "scanning" + RST + " " + tgt + " (" + str(len(PORTS)) + " common ports)\n")
-    for p in PORTS:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(0.6)
-        try:
-            s.connect((tgt, p))
-            print("  " + OK + "open" + RST + "   " + str(p))
-        except Exception:
-            pass
-        finally:
-            s.close()
-
-def ip_info():
-    t = ask("ip or domain:")
-    if not t:
-        return
-    d = http_json("http://ip-api.com/json/" + t) or {}
-    if d.get("status") != "success":
-        print("  " + ERR + "lookup failed" + RST)
-        return
-    for k in ("query", "country", "regionName", "city", "zip", "timezone",
-              "isp", "org", "as", "reverse"):
-        print("  " + A3 + k.ljust(10) + RST + " " + str(d.get(k, "-")))
-    print("  " + A3 + "coords".ljust(10) + RST + " " + str(d.get("lat")) + ", " + str(d.get("lon")))
-    for flag in ("mobile", "proxy", "hosting"):
-        print("  " + A3 + flag.ljust(10) + RST + " " + str(d.get(flag)))
-
-def url_info():
-    u = ask("url (full http/https):")
-    if not u:
-        return
-    code = http_status(u)
-    print("  " + A3 + "status".ljust(8) + RST + " " + str(code))
-    body = get(u)
-    m = re.search(r"<title[^>]*>(.{0,90}?)</title>", body, re.S | re.I)
-    if m:
-        print("  " + A3 + "title".ljust(8) + RST + " " + m.group(1).strip())
-    host = u.split("//")[-1].split("/")[0].split(":")[0]
-    d = http_json("http://ip-api.com/json/" + host + "?fields=query,country,isp") or {}
-    if d:
-        print("  " + A3 + "host-ip".ljust(8) + RST + " " + str(d.get("query", "-")) + " [" + str(d.get("country", "")) + "] " + str(d.get("isp", "")))
-
-# ---------- osint ----------
-def deep_tiktok(username):
-    d = http_json("https://www.tiktok.com/api/user/detail/?uniqueId=" + username)
-    user, stats = {}, {}
-    if isinstance(d, dict):
-        block = d.get("userInfo") or d or {}
-        user = block.get("user", {}) or block.get("userDict", {})
-        stats = block.get("stats", {})
-    if not user:
-        code = http_status("https://www.tiktok.com/@" + username)
-        if code == 200:
-            print("  " + A1 + "== TIKTOK == " + RST + "(limited data - page exists)")
-            print("  " + A3 + "profile".ljust(10) + RST + " https://www.tiktok.com/@" + username)
-        else:
-            print("  " + DIM + "TikTok: no public data (blocked/private)" + RST)
-        return
-    print("  " + A1 + "== TIKTOK ==" + RST)
-    rows = [
-        ("nickname", user.get("nickname", "-")),
-        ("handle", user.get("uniqueId", username)),
-        ("bio", (user.get("signature", "-") or "-")[:70]),
-        ("verified", str(user.get("verified", False))),
-        ("userId", user.get("id", "-")),
-        ("secUid", (user.get("secUid", "-") or "-")[:34]),
-        ("followers", str(stats.get("followerCount", "-"))),
-        ("following", str(stats.get("followingCount", "-"))),
-        ("hearts", str(stats.get("heartCount", "-"))),
-        ("videos", str(stats.get("videoCount", "-"))),
+def boot():
+    clear()
+    banner()
+    steps = [
+        "Initializing XOR runtime",
+        "Loading local operator profile",
+        "Mounting persistent cache",
+        "Checking terminal environment",
+        "Preparing command interface",
     ]
-    for k, v in rows:
-        print("  " + A3 + k.ljust(10) + RST + " " + str(v))
-    print("  " + A3 + "profile".ljust(10) + RST + " https://www.tiktok.com/@" + username)
-
-def snowflake_date(sid):
+    for item in steps:
+        print(color("[", V) + color(" OK ", L) + color("] ", V) + color(item, W))
+        time.sleep(0.22)
     try:
-        ts = (int(sid) >> 22) + 1420070400000
-        return datetime.fromtimestamp(ts / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+        uname = platform.system() + " " + platform.release()
     except Exception:
-        return "-"
-
-def deep_discord(ident):
-    if not ident.isdigit():
-        print("  " + DIM + "Discord: paste a numeric ID (17-20 digits) - username lookup is auth-gated" + RST)
-        return
-    d = http_json("https://discord.com/api/v9/users/" + ident + "/profile")
-    if not d or "user" not in d:
-        print("  " + DIM + "Discord: not found / blocked (needs open profile)" + RST)
-        return
-    u = d.get("user", {})
-    print("  " + A1 + "== DISCORD ==" + RST)
-    rows = [
-        ("id", u.get("id", ident)),
-        ("username", u.get("username", "-")),
-        ("display", u.get("global_name", "-")),
-        ("bot", str(u.get("bot", False))),
-        ("banner", (u.get("banner") or "-")[:34]),
-        ("avatar", (u.get("avatar") or "-")[:34]),
-        ("created", snowflake_date(ident)),
+        uname = "Unknown"
+    now = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    info = [
+        ("STATUS", "ONLINE"),
+        ("OPERATOR.ACCESS", "LOCAL SESSION"),
+        ("DEVICE", get_android_model()),
+        ("NODE", socket.gethostname()),
+        ("TIME", now),
+        ("OS", uname),
+        ("LOCAL.IP", get_local_ip()),
+        ("CACHE", "READY  •  " + BASE),
     ]
-    for k, v in rows:
-        print("  " + A3 + k.ljust(10) + RST + " " + str(v))
-    conns = d.get("connected_accounts", [])
-    if conns:
-        print("  " + A3 + "linked".ljust(10) + RST + " " + ", ".join(str(c.get("type", "?")) for c in conns[:8]))
+    line("═")
+    for k, v in info:
+        print(color("  " + k.ljust(17), V) + color(v, W))
+    line("═")
+    print(color("  WARNING: Use network tools only with permission.", R))
+    print(color("  OSINT tools use public information only.", G))
+    line()
+    typewrite("XOR READY. TYPE !help TO VIEW COMMANDS.", 0.012, L)
+    print(color("\n  xor@xor:~$ ", P), end="", flush=True)
 
-SITES = [
-    ("Instagram", "https://www.instagram.com/"),
-    ("GitHub", "https://github.com/"),
-    ("Reddit", "https://www.reddit.com/user/"),
-    ("Telegram", "https://t.me/"),
-    ("Twitch", "https://www.twitch.tv/"),
-    ("Snapchat", "https://www.snapchat.com/add/"),
-    ("Pinterest", "https://www.pinterest.com/"),
-    ("Spotify", "https://open.spotify.com/user/"),
-    ("Steam", "https://steamcommunity.com/id/"),
-    ("Facebook", "https://www.facebook.com/"),
-    ("Replit", "https://replit.com/@"),
-    ("YouTube", "https://www.youtube.com/@"),
-    ("X", "https://x.com/"),
-    ("Roblox", "https://www.roblox.com/users/profile?username="),
-    ("Xbox", "https://www.xbox.com/en-US/search?q="),
-]
+def help_menu():
+    clear(); banner()
+    print(color(" COMMAND DIRECTORY", L)); line()
+    rows = [
+        ("!scan", "LAN discovery, host details, authorized port check"),
+        ("!osint", "Public IP, URL, email and username lookups"),
+        ("!gen", "Synthetic test data generators"),
+        ("!notes", "Create, read, edit, delete and search notes"),
+        ("!links", "Save, list, copy and open useful links"),
+        ("!system", "Device, network, storage and runtime details"),
+        ("!history", "Recent commands"),
+        ("!settings", "Theme and animation preferences"),
+        ("!clear", "Clear terminal"),
+        ("!help", "Show this menu"),
+        ("!exit", "Close XOR"),
+    ]
+    for cmd, desc in rows:
+        print("  " + color(cmd.ljust(13), P) + color(desc, W))
+    line()
+    print(color("Tip: menus also accept their command name without '!'.", G))
 
-def username_lookup():
-    u = ask("username:")
-    if not u:
-        return
-    mode = ask("deep (d) or quick (q)? [d]:") or "d"
-    print()
-    if mode == "d":
-        deep_tiktok(u)
-        print()
-        deep_discord(u)
-        print()
-    hits = 0
-    for name, url in SITES:
-        code = http_status(url + u)
-        if code == 200:
-            print("  " + OK + "[+] " + name.ljust(11) + RST + " " + url + u)
-            hits += 1
-        elif code == 404:
-            print("  " + DIM + "[-] " + name.ljust(11) + RST + " none")
-        else:
-            print("  " + WARN + "[?] " + name.ljust(11) + RST + " http " + str(code))
-        time.sleep(0.15)
-    print("\n  " + A3 + "hits: " + str(hits) + RST)
+def fetch(url, method="GET", timeout=7, headers=None):
+    req = urllib.request.Request(url, method=method, headers=headers or {"User-Agent": "XOR-Termux/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout, context=ssl.create_default_context()) as response:
+        return response.status, response.headers, response.read(16000)
 
-def email_lookup():
-    e = ask("email address:")
-    if not e:
-        return
-    ok = re.match(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$", e)
-    print("  " + A3 + "format".ljust(11) + RST + " " + ("valid" if ok else "suspicious"))
-    d = http_json("https://emailrep.io/" + e)
-    if d:
-        for k in ("reputation", "suspicious", "blacklisted", "malicious_activity"):
-            print("  " + A3 + k.ljust(11) + RST + " " + str(d.get(k, "-")))
-        prof = d.get("details", {}).get("profiles", [])
-        if prof:
-            print("  " + A3 + "profiles".ljust(11) + RST + " " + ", ".join(str(p) for p in prof[:10]))
-    else:
-        print("  " + WARN + "no response (rate limited or offline)" + RST)
+def public_ip_lookup(value):
+    try:
+        ip = ipaddress.ip_address(value)
+        if not ip.is_global:
+            print(color("That is not a public routable IP address.", R)); return
+    except ValueError:
+        print(color("Invalid IP address.", R)); return
+    try:
+        status, _, body = fetch("https://ipwho.is/" + value)
+        data = json.loads(body.decode("utf-8", "replace"))
+        if not data.get("success", True):
+            print(color("Lookup provider could not return details.", R)); return
+        for k in ("ip", "type", "continent", "country", "region", "city", "connection", "timezone"):
+            val = data.get(k)
+            if isinstance(val, dict):
+                val = ", ".join(str(x) for x in val.values() if x)
+            if val:
+                print(color("  " + k.upper().ljust(14), V) + color(str(val), W))
+    except Exception as e:
+        print(color("Lookup failed: " + str(e), R))
+
+def url_lookup(raw):
+    raw = raw if "://" in raw else "https://" + raw
+    parsed = urlparse(raw)
+    host = parsed.hostname
+    if not host:
+        print(color("That URL/host doesn't look valid.", R)); return
+    print(color("\n[ URL INTELLIGENCE ]", L)); line()
+    print(color("HOST       ", V) + color(host, W))
+    print(color("SCHEME     ", V) + color(parsed.scheme, W))
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+        ips = sorted({x[4][0] for x in infos})
+        print(color("DNS        ", V) + color(", ".join(ips), W))
+    except Exception as e:
+        print(color("DNS        ", V) + color("Lookup failed: " + str(e), R))
+    try:
+        status, headers, _ = fetch(raw, method="HEAD", timeout=7)
+        print(color("HTTP       ", V) + color(str(status), W))
+        for key in ("server", "content-type", "content-length", "last-modified"):
+            if headers.get(key):
+                print(color(key.upper().ljust(11), V) + color(headers.get(key), W))
+    except Exception as e:
+        print(color("HTTP       ", V) + color("Could not retrieve headers: " + str(e), G))
+
+def email_lookup(addr):
+    if not re.fullmatch(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", addr):
+        print(color("Email format appears invalid.", R)); return
+    domain = addr.rsplit("@", 1)[1].lower()
+    print(color("FORMAT     ", V) + color("Valid-looking syntax", W))
+    print(color("DOMAIN     ", V) + color(domain, W))
+    try:
+        records = socket.getaddrinfo(domain, 25, type=socket.SOCK_STREAM)
+        print(color("DOMAIN DNS ", V) + color("Resolves", W))
+    except Exception:
+        print(color("DOMAIN DNS ", V) + color("No DNS result (or network unavailable)", G))
+    print(color("LIMIT      ", V) + color("No mailbox delivery or ownership verification is performed.", G))
+
+PLATFORMS = {
+    "TikTok": "https://www.tiktok.com/@{}",
+    "Instagram": "https://www.instagram.com/{}/",
+    "Roblox": "https://www.roblox.com/search/users?keyword={}",
+    "X": "https://x.com/{}",
+    "GitHub": "https://github.com/{}",
+    "Reddit": "https://www.reddit.com/user/{}/",
+    "Twitch": "https://www.twitch.tv/{}",
+    "YouTube": "https://www.youtube.com/@{}",
+    "Pinterest": "https://www.pinterest.com/{}/",
+    "Facebook": "https://www.facebook.com/{}",
+}
+
+def username_lookup(username):
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,30}", username):
+        print(color("Use 1–30 letters, numbers, dots, underscores or hyphens.", R)); return
+    print(color("\nPUBLIC PROFILE URLS", L)); line()
+    for name, template in PLATFORMS.items():
+        print(color("  " + name.ljust(12), V) + color(template.format(username), W))
+    print(color("\nThese are profile links, not confirmed account matches.", G))
+    print(color("Open each platform to verify public profile details; no login bypasses.", G))
 
 def osint_menu():
     while True:
-        title("OSINT MENU")
-        print("  " + A1 + "[1]" + RST + " IP lookup        (geo / isp / proxy)")
-        print("  " + A1 + "[2]" + RST + " URL lookup       (status / title / ip)")
-        print("  " + A1 + "[3]" + RST + " email lookup     (reputation)")
-        print("  " + A1 + "[4]" + RST + " username search  (TikTok + Discord deep, 15 quick)")
-        print("  " + A1 + "[0]" + RST + " back\n")
-        c = input("  xor@osint > ").strip()
-        if c == "1":
-            os.system("clear"); ip_info(); pause()
-        elif c == "2":
-            os.system("clear"); url_info(); pause()
-        elif c == "3":
-            os.system("clear"); email_lookup(); pause()
-        elif c == "4":
-            os.system("clear"); username_lookup(); pause()
-        elif c == "0":
-            break
+        print(color("\n[ OSINT / PUBLIC DATA ]", L)); line()
+        print("  1. Public IP lookup\n  2. URL / domain inspection\n  3. Email syntax + domain check\n  4. Username platform search\n  0. Back")
+        choice = safe_input("xor@xor/osint > ")
+        if choice == "1":
+            public_ip_lookup(safe_input("Public IP: "))
+        elif choice == "2":
+            url_lookup(safe_input("URL or domain: "))
+        elif choice == "3":
+            email_lookup(safe_input("Email: "))
+        elif choice == "4":
+            username_lookup(safe_input("Username: "))
+        elif choice == "0": return
+        else: print(color("Unknown option.", R))
+        pause()
 
 def scan_menu():
     while True:
-        title("SCAN MENU")
-        print("  " + A1 + "[1]" + RST + " LAN device sweep  (ip + mac + vendor)")
-        print("  " + A1 + "[2]" + RST + " port scan         (common ports)")
-        print("  " + A1 + "[3]" + RST + " IP intel")
-        print("  " + A1 + "[4]" + RST + " website intel")
-        print("  " + A1 + "[0]" + RST + " back\n")
-        c = input("  xor@scan > ").strip()
-        if c == "1":
-            os.system("clear"); lan_scan(); pause()
-        elif c == "2":
-            os.system("clear"); port_scan(); pause()
-        elif c == "3":
-            os.system("clear"); ip_info(); pause()
-        elif c == "4":
-            os.system("clear"); url_info(); pause()
-        elif c == "0":
-            break
+        print(color("\n[ NETWORK SCANNER ]", L)); line()
+        print("  1. Show local network details\n  2. Discover devices on my /24 LAN\n  3. Check common ports on one authorized host\n  0. Back")
+        choice = safe_input("xor@xor/scan > ")
+        if choice == "1":
+            ip = get_local_ip()
+            print(color("LOCAL IP   ", V) + color(ip, W))
+            try:
+                print(color("HOSTNAME  ", V) + color(socket.gethostname(), W))
+                print(color("REVERSE   ", V) + color(socket.gethostbyaddr(ip)[0], W))
+            except Exception:
+                pass
+            print(color("NOTE      ", V) + color("Gateway/subnet details depend on Android permissions.", G))
+        elif choice == "2":
+            ip = get_local_ip()
+            try:
+                addr = ipaddress.ip_address(ip)
+                if addr.version != 4 or not addr.is_private:
+                    raise ValueError()
+            except ValueError:
+                print(color("Could not determine a private IPv4 LAN address.", R)); pause(); continue
+            if safe_input("Scan your local /24 network? Type YES to confirm: ") != "YES":
+                print(color("Cancelled.", G)); continue
+            net = ipaddress.ip_network(str(addr) + "/24", strict=False)
+            print(color("Scanning up to 254 local addresses; this may take a moment...", G))
+            found = 0
+            for target in net.hosts():
+                host = str(target)
+                s = socket.socket()
+                s.settimeout(0.12)
+                try:
+                    s.connect((host, 80))
+                    is_up = True
+                except OSError:
+                    is_up = False
+                finally:
+                    s.close()
+                if is_up or host == ip:
+                    found += 1
+                    try: name = socket.gethostbyaddr(host)[0]
+                    except Exception: name = "Unknown hostname"
+                    mac = "Unavailable"
+                    try:
+                        with open("/proc/net/arp", "r") as f:
+                            for row in f.readlines()[1:]:
+                                parts = row.split()
+                                if len(parts) >= 4 and parts[0] == host:
+                                    mac = parts[3]; break
+                    except OSError: pass
+                    print(color("  " + host.ljust(16), P) + color(name, W) + color("  MAC " + mac, G))
+            print(color(f"Finished. {found} responsive/known device(s) found.", L))
+            print(color("Note: this lightweight check detects HTTP port 80 responders only; sleeping/firewalled devices may be missed.", G))
+        elif choice == "3":
+            host = safe_input("Host/IP you own or have permission to test: ")
+            try:
+                socket.getaddrinfo(host, None)
+            except OSError:
+                print(color("Host could not be resolved.", R)); pause(); continue
+            if safe_input("Confirm you have permission? Type YES: ") != "YES":
+                print(color("Cancelled.", G)); continue
+            ports = [21, 22, 23, 25, 53, 80, 110, 143, 443, 445, 8080, 8443]
+            print(color("Checking a small set of common TCP ports...", G))
+            for port in ports:
+                s = socket.socket(); s.settimeout(0.45)
+                try:
+                    result = s.connect_ex((host, port))
+                    if result == 0: print(color(f"  {port:<6} OPEN", L))
+                except OSError: pass
+                finally: s.close()
+            print(color("Check complete.", G))
+        elif choice == "0": return
+        else: print(color("Unknown option.", R))
+        pause()
 
-# ---------- generators (random TEST data only) ----------
-FIRST = "James Maria Liam Aisha Noah Zoe Ethan Maya Kai Nova Luis Sara Omar Hana".split()
-LAST = "Carter Silva Chen Okafor Novak Reyes Kim Frost Adler Vance Moreau Ito".split()
-STREETS = "Oak Maple Cedar Ridge Pine Bay Hill Lake View Park Stone Vine".split()
-CITY = "Toronto Berlin Miami Austin Osaka Lisbon Accra Manila Kyiv Lima Oslo".split()
-
-def rname():
-    return random.choice(FIRST) + " " + random.choice(LAST)
-
-def luhn_card():
-    n = "".join(random.choice("0123456789") for _ in range(15))
-    total = 0
-    for i, ch in enumerate(n):
-        d = int(ch)
-        if i % 2 == 0:
-            d *= 2
-            if d > 9:
-                d -= 9
-        total += d
-    check = (10 - total % 10) % 10
-    return "4" + n[:3] + " " + n[3:7] + " " + n[7:11] + " " + n[11:15] + " " + str(check)
-
-def gen_menu():
+def generate_menu():
     while True:
-        title("GENERATORS  (random test data, not real people)")
-        print("  " + A1 + "[1]" + RST + " name      " + A1 + "[2]" + RST + " address     " + A1 + "[3]" + RST + " phone")
-        print("  " + A1 + "[4]" + RST + " email     " + A1 + "[5]" + RST + " ipv4        " + A1 + "[6]" + RST + " test card")
-        print("  " + A1 + "[7]" + RST + " ssn-fmt   " + A1 + "[8]" + RST + " crypto addr " + A1 + "[9]" + RST + " password")
-        print("  " + A1 + "[0]" + RST + " back\n")
-        c = input("  xor@gen > ").strip()
-        out = None
-        if c == "1":
-            out = rname()
-        elif c == "2":
-            out = "%d %s St, %s %05d" % (random.randint(100, 9999), random.choice(STREETS), random.choice(CITY), random.randint(10000, 99999))
-        elif c == "3":
-            out = "+1 (%03d) %03d-%04d" % (random.randint(200, 499), random.randint(0, 999), random.randint(0, 9999))
-        elif c == "4":
-            out = rname().lower().replace(" ", ".") + "%04d@example.test" % random.randint(0, 9999)
-        elif c == "5":
-            out = "%d.%d.%d.%d" % (random.randint(1, 223), random.randint(0, 255), random.randint(0, 255), random.randint(1, 254))
-        elif c == "6":
-            out = luhn_card() + "  (test, luhn-valid)"
-        elif c == "7":
-            out = "%03d-%02d-%04d  (random, not a real person)" % (random.randint(100, 899), random.randint(1, 99), random.randint(0, 9999))
-        elif c == "8":
-            pfx = "bc1q" if random.randint(0, 1) else "0x"
-            n = 38 if pfx == "bc1q" else 40
-            out = pfx + "".join(random.choice("0123456789abcdef") for _ in range(n))
-        elif c == "9":
-            pool = "abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789!@#$%"
-            out = "".join(random.choice(pool) for _ in range(16))
-        elif c == "0":
-            break
-        if out:
-            print("\n  " + A2 + out + RST)
-            pause()
+        print(color("\n[ SYNTHETIC DATA GENERATOR ]", L)); line()
+        print("  1. Random name\n  2. Test email\n  3. Documentation IP\n  4. Fictional phone number\n  5. Random username\n  6. Strong random password\n  0. Back")
+        c = safe_input("xor@xor/gen > ")
+        first = ["Alex", "Jordan", "Riley", "Taylor", "Morgan", "Casey", "Avery", "Jamie"]
+        last = ["Reed", "Hayes", "Parker", "Stone", "Brooks", "Quinn", "Blake", "Wells"]
+        if c == "1": result = random.choice(first) + " " + random.choice(last)
+        elif c == "2": result = "test" + str(random.randint(1000,9999)) + "@example.com"
+        elif c == "3": result = random.choice(["192.0.2.", "198.51.100.", "203.0.113."]) + str(random.randint(1,254))
+        elif c == "4": result = "+1-202-555-" + str(random.randint(1000,1999))
+        elif c == "5": result = random.choice(first).lower() + str(random.randint(10,999))
+        elif c == "6": result = "".join(random.SystemRandom().choice("ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%&*") for _ in range(20))
+        elif c == "0": return
+        else: print(color("Unknown option.", R)); continue
+        print(color("\n  GENERATED: ", V) + color(result, W))
+        print(color("  Synthetic/demo data only — not a real person's details.", G))
+        if safe_input("Copy to clipboard if Termux:API is installed? (y/N): ").lower() == "y":
+            copy_text(result)
+        pause()
 
-# ---------- links + notes ----------
-def notes_menu():
-    linksp = os.path.join(CACHE, "links")
-    notesp = os.path.join(CACHE, "notes")
-    while True:
-        title("LINKS + NOTES")
-        print("  LINKS  " + A1 + "[1]" + RST + " add  " + A1 + "[2]" + RST + " open  " + A1 + "[3]" + RST + " copy  " + A1 + "[4]" + RST + " list  " + A1 + "[5]" + RST + " del")
-        print("  NOTES  " + A1 + "[6]" + RST + " add  " + A1 + "[7]" + RST + " view  " + A1 + "[8]" + RST + " copy  " + A1 + "[9]" + RST + " del")
-        print("  " + A1 + "[0]" + RST + " back\n")
-        c = input("  xor@lib > ").strip()
-        if c == "1":
-            v = ask("link url:")
-            if v:
-                open(linksp, "a").write(v + "\n")
-                print("  " + OK + "saved" + RST)
-        elif c in ("2", "3", "4", "5"):
-            lines = open(linksp).read().splitlines()
-            if c == "4":
-                if not lines:
-                    print("  " + DIM + "empty" + RST)
-                for i, l in enumerate(lines, 1):
-                    print("  " + str(i) + ". " + l)
-            elif not lines:
-                print("  " + DIM + "empty" + RST)
-            else:
-                for i, l in enumerate(lines, 1):
-                    print("  " + str(i) + ". " + l)
-                n = ask("number:")
-                if n.isdigit() and 0 < int(n) <= len(lines):
-                    v = lines[int(n) - 1]
-                    if c == "2":
-                        open_url(v)
-                    elif c == "3":
-                        clipboard_set(v)
-                    else:
-                        del lines[int(n) - 1: int(n)]
-                        open(linksp, "w").write("\n".join(lines) + ("\n" if lines else ""))
-                        print("  " + OK + "deleted" + RST)
-        elif c == "6":
-            v = ask("note text:")
-            if v:
-                open(notesp, "a").write(datetime.now().strftime("%m-%d %H:%M") + " | " + v + "\n")
-                print("  " + OK + "saved" + RST)
-        elif c in ("7", "8", "9"):
-            lines = open(notesp).read().splitlines()
-            if not lines:
-                print("  " + DIM + "empty" + RST)
-            else:
-                for i, l in enumerate(lines, 1):
-                    print("  " + str(i) + ". " + l)
-                if c in ("8", "9"):
-                    n = ask("number:")
-                    if n.isdigit() and 0 < int(n) <= len(lines):
-                        if c == "8":
-                            clipboard_set(lines[int(n) - 1])
-                        else:
-                            del lines[int(n) - 1: int(n)]
-                            open(notesp, "w").write("\n".join(lines) + ("\n" if lines else ""))
-                            print("  " + OK + "deleted" + RST)
-        elif c == "0":
-            break
-
-# ---------- extras ----------
-def theme_menu():
-    title("THEME")
-    print("  " + A1 + "[1]" + RST + " cyan  " + A1 + "[2]" + RST + " green  " + A1 + "[3]" + RST + " purple  " + A1 + "[4]" + RST + " red  " + A1 + "[5]" + RST + " amber  " + A1 + "[6]" + RST + " ice\n")
-    c = input("  xor@theme > ").strip()
-    names = {"1": "cyan", "2": "green", "3": "purple", "4": "red", "5": "amber", "6": "ice"}
-    if c in names:
-        open(os.path.join(CACHE, "theme"), "w").write(names[c])
-        load_theme()
-        print("  " + OK + "theme applied" + RST)
-
-def sysinfo():
-    title("SYSTEM")
-    mem = "-"
+def copy_text(text):
     try:
-        with open("/proc/meminfo") as f:
-            for line in f:
-                if line.startswith("MemTotal"):
-                    mem = line.split()[1] + " kB total"
-                    break
-    except Exception:
-        pass
-    du = shutil.disk_usage(HOME)
-    cache_size = sum(
-        os.path.getsize(os.path.join(CACHE, f))
-        for f in os.listdir(CACHE)
-        if os.path.isfile(os.path.join(CACHE, f))
-    )
-    rows = [
-        ("memory", mem),
-        ("storage", str(du.used // (1 << 30)) + "G used / " + str(du.total // (1 << 30)) + "G"),
-        ("cpu", os.uname().machine),
-        ("python", sys.version.split()[0]),
-        ("local-ip", local_ip()),
-        ("cache", str(cache_size) + " bytes"),
-    ]
-    for k, v in rows:
-        print("  " + A3 + k.ljust(10) + RST + " " + str(v))
+        p = subprocess.run(["termux-clipboard-set"], input=text, text=True, timeout=3)
+        if p.returncode == 0: print(color("Copied to clipboard.", L)); return
+    except Exception: pass
+    print(color("Clipboard tool unavailable. Select and copy the text above.", G))
 
-def show_help():
-    os.system("clear")
-    print()
-    cprint("XOR MENU")
-    hr()
-    print()
-    print("  " + A1 + "[1]" + RST + " !scan    LAN sweep / port scan / IP + site intel")
-    print("  " + A1 + "[2]" + RST + " !osint   IP / URL / email / username (TikTok + Discord deep)")
-    print("  " + A1 + "[3]" + RST + " !gen     names, addresses, test cards, crypto, passwords")
-    print("  " + A1 + "[4]" + RST + " !notes   links + notes: add / open / copy / view / del")
-    print()
-    print("  " + A2 + "extra" + RST + "  !theme  !sys  !banner  !hist  !cache  !clear  !exit")
-    print("  " + A2 + "tip" + RST + "    any shell command typed here runs directly\n")
-
-def prompt_loop():
+def notes_menu():
     while True:
-        try:
-            cmd = input("\n  " + A1 + "xor@xor" + RST + " " + A3 + "~" + RST + " ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n  " + A1 + "bye" + RST)
-            break
-        if not cmd:
-            continue
-        with open(os.path.join(CACHE, "history"), "a") as f:
-            f.write(cmd + "\n")
-        if cmd in ("!help", "!", "help"):
-            show_help()
-        elif cmd in ("!scan", "!1"):
-            scan_menu()
-        elif cmd in ("!osint", "!2"):
-            osint_menu()
-        elif cmd in ("!gen", "!3"):
-            gen_menu()
-        elif cmd in ("!notes", "!links", "!4"):
-            notes_menu()
-        elif cmd == "!theme":
-            theme_menu()
-        elif cmd == "!sys":
-            sysinfo()
-        elif cmd == "!banner":
-            banner_again()
-        elif cmd in ("!hist", "!history"):
-            lines = open(os.path.join(CACHE, "history")).read().splitlines()[-20:]
-            for i, l in enumerate(lines, 1):
-                print("  " + str(i) + ". " + l)
-        elif cmd == "!cache":
-            for f in sorted(os.listdir(CACHE)):
-                print("  " + f)
-        elif cmd == "!clear":
-            os.system("clear")
-        elif cmd in ("!exit", "!quit", "exit", "quit"):
-            print("  " + A1 + "bye" + RST)
-            break
-        else:
-            if shutil.which(cmd.split()[0]):
-                os.system(cmd)
+        print(color("\n[ NOTES ]", L)); line()
+        print("  1. Create note\n  2. List / read notes\n  3. Search notes\n  4. Edit note\n  5. Delete note\n  0. Back")
+        c = safe_input("xor@xor/notes > ")
+        notes = DATA["notes"]
+        if c == "1":
+            title = safe_input("Title: ")
+            body = safe_input("Text: ")
+            if title and body:
+                notes.append({"title": title, "body": body, "created": datetime.now().isoformat(timespec="seconds")})
+                save_data(); print(color("Note saved.", L))
+        elif c in ("2", "4", "5"):
+            if not notes: print(color("No notes saved yet.", G)); pause(); continue
+            for i, n in enumerate(notes, 1): print(color(f"  {i}. ", P) + color(n["title"], W))
+            try: idx = int(safe_input("Note number: ")) - 1
+            except ValueError: idx = -1
+            if not 0 <= idx < len(notes): print(color("Invalid note number.", R))
+            elif c == "2":
+                n = notes[idx]; line(); print(color(n["title"], L)); print(n["body"])
+                if safe_input("Copy note? (y/N): ").lower() == "y": copy_text(n["body"])
+            elif c == "4":
+                notes[idx]["title"] = safe_input("New title (blank keeps current): ") or notes[idx]["title"]
+                notes[idx]["body"] = safe_input("New text: ") or notes[idx]["body"]
+                save_data(); print(color("Updated.", L))
             else:
-                print("  " + WARN + "[?]" + RST + " unknown command: " + cmd + "  (!help)")
+                if safe_input("Delete this note? (yes/no): ").lower() == "yes":
+                    notes.pop(idx); save_data(); print(color("Deleted.", L))
+        elif c == "3":
+            term = safe_input("Search text: ").lower()
+            matches = [n for n in notes if term in n["title"].lower() or term in n["body"].lower()]
+            for n in matches: print(color("  " + n["title"], L) + color(" — " + n["body"][:100], W))
+            if not matches: print(color("No matches.", G))
+        elif c == "0": return
+        else: print(color("Unknown option.", R))
+        pause()
+
+def links_menu():
+    while True:
+        print(color("\n[ LINKS ]", L)); line()
+        print("  1. Save link\n  2. List links\n  3. Open link\n  4. Copy link\n  5. Delete link\n  0. Back")
+        c = safe_input("xor@xor/links > ")
+        links = DATA["links"]
+        if c == "1":
+            label = safe_input("Label: ")
+            url = safe_input("URL: ")
+            if url and not url.startswith(("https://", "http://")): url = "https://" + url
+            if label and urlparse(url).hostname:
+                links.append({"label": label, "url": url}); save_data()
+                print(color("Link saved.", L))
+            else: print(color("Invalid URL.", R))
+        elif c in ("2", "3", "4", "5"):
+            if not links: print(color("No links saved yet.", G)); pause(); continue
+            for i, item in enumerate(links, 1):
+                print(color(f"  {i}. ", P) + color(item["label"], W) + color("  " + item["url"], G))
+            if c != "2":
+                try: idx = int(safe_input("Link number: ")) - 1
+                except ValueError: idx = -1
+                if not 0 <= idx < len(links): print(color("Invalid link number.", R))
+                elif c == "3":
+                    url = links[idx]["url"]
+                    try:
+                        if "ANDROID_ROOT" in os.environ or "TERMUX_VERSION" in os.environ:
+                            subprocess.Popen(["termux-open-url", url])
+                        else:
+                            import webbrowser; webbrowser.open(url)
+                        print(color("Opening link...", L))
+                    except Exception: print(color("Could not open link: " + url, G))
+                elif c == "4": copy_text(links[idx]["url"])
+                elif c == "5":
+                    if safe_input("Delete link? (yes/no): ").lower() == "yes":
+                        links.pop(idx); save_data(); print(color("Deleted.", L))
+        elif c == "0": return
+        else: print(color("Unknown option.", R))
+        pause()
+
+def system_menu():
+    clear(); banner()
+    print(color("[ SYSTEM INFORMATION ]", L)); line()
+    values = [
+        ("Platform", platform.platform()),
+        ("Python", sys.version.split()[0]),
+        ("Architecture", platform.machine()),
+        ("Hostname", socket.gethostname()),
+        ("Local IP", get_local_ip()),
+        ("Storage path", BASE),
+        ("Saved notes", str(len(DATA["notes"]))),
+        ("Saved links", str(len(DATA["links"]))),
+    ]
+    for k, v in values: print(color("  " + k.ljust(16), V) + color(str(v), W))
+    try:
+        st = os.statvfs(os.path.expanduser("~"))
+        free = st.f_bavail * st.f_frsize / (1024**3)
+        print(color("  Free storage     ", V) + color(f"{free:.2f} GB", W))
+    except Exception: pass
+
+def settings_menu():
+    print(color("\n[ SETTINGS ]", L)); line()
+    print("  Theme: PURPLE / BLACK (XOR default)")
+    print("  Animation: enabled during startup")
+    print("  Data: " + DATA_FILE)
+    print(color("  All notes, links, history and settings persist between launches.", G))
+    if safe_input("Clear command history? (y/N): ").lower() == "y":
+        DATA["history"] = []; save_data(); print(color("History cleared.", L))
 
 def main():
-    jump = {
-        "scan": scan_menu, "!scan": scan_menu,
-        "osint": osint_menu, "!osint": osint_menu,
-        "gen": gen_menu, "!gen": gen_menu,
-        "notes": notes_menu, "!notes": notes_menu,
-        "-h": show_help, "--help": show_help,
-    }
-    if len(sys.argv) > 1 and sys.argv[1] in jump:
-        jump[sys.argv[1]]()
-        return
     boot()
-    prompt_loop()
+    while True:
+        cmd = safe_input("xor@xor:~$ ").lower()
+        if not cmd: continue
+        record_history(cmd)
+        if cmd in ("!help", "help"): help_menu(); pause()
+        elif cmd in ("!scan", "scan"): scan_menu()
+        elif cmd in ("!osint", "osint"): osint_menu()
+        elif cmd in ("!gen", "gen"): generate_menu()
+        elif cmd in ("!notes", "notes"): notes_menu()
+        elif cmd in ("!links", "links"): links_menu()
+        elif cmd in ("!system", "system"): system_menu(); pause()
+        elif cmd in ("!settings", "settings"): settings_menu(); pause()
+        elif cmd in ("!history", "history"):
+            for item in DATA["history"][-20:]:
+                print(color("  " + item["time"] + "  ", G) + color(item["command"], W))
+            pause()
+        elif cmd in ("!clear", "clear"): clear(); banner()
+        elif cmd in ("!exit", "exit", "quit"):
+            save_data(); typewrite("Closing XOR session. Stay sharp.", 0.015, L); break
+        else: print(color("Unknown command. Type !help.", R))
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n" + RST + "bye")
-PYEOF
-chmod +x ~/xor.py
-python ~/xor.py
+        save_data()
+        print(color("\nXOR session interrupted. Data saved.", G))
